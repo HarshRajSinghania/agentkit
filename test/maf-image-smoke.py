@@ -53,16 +53,24 @@ def check_runtime() -> None:
     import pydantic_core  # noqa: F401
     import yaml  # noqa: F401
     from agent_framework.azure import AzureAISearchContextProvider  # noqa: F401
-    from agent_framework.foundry import FoundryChatClient, FoundryMemoryProvider  # noqa: F401
+    from agent_framework.foundry import (  # noqa: F401
+        FoundryChatClient,
+        FoundryMemoryProvider,
+    )
     from azure.identity import DefaultAzureCredential  # noqa: F401
-    from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential  # noqa: F401
+    from azure.identity.aio import (
+        DefaultAzureCredential as AsyncDefaultAzureCredential,  # noqa: F401
+    )
 
     subprocess.run(
         ["/opt/agentkit/bin/agentkit-serve", "--help"],
         check=True,
         stdout=subprocess.DEVNULL,
     )
-    print(f"MAF native/provider imports passed: Python {sys.version.split()[0]}", flush=True)
+    print(
+        f"MAF native/provider imports passed: Python {sys.version.split()[0]}",
+        flush=True,
+    )
     print("runtime contract passed", flush=True)
 
 
