@@ -19,6 +19,7 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from agentkit_serve import agent_factory
 from agentkit_serve.agent_factory import ChatOpenAI
+from agentkit_serve_common import model_api_auto
 from agentkit_serve_common.config import AgentSpec
 from agentkit_serve_common.conversation import ConversationTurn, RunRequest
 from agentkit_serve_common.runtime import AgentRunError
@@ -154,6 +155,7 @@ def _payload(request, model_api, *, streaming=False):
     else:
         assert "input" not in payload
         assert "store" not in payload
+        assert "include" not in payload
     return payload
 
 
@@ -185,6 +187,7 @@ def test_build_model_selects_upstream_api_explicitly(monkeypatch, model_api):
         api_key="not-needed",
         use_responses_api=model_api in {"responses", "auto"},
         store=False if model_api in {"responses", "auto"} else None,
+        include=["reasoning.encrypted_content"] if model_api in {"responses", "auto"} else None,
     )
 
 
@@ -209,6 +212,7 @@ def test_build_model_uses_concrete_auto_candidate_and_wraps_only_async(monkeypat
         api_key=_API_KEY,
         use_responses_api=model_api == "responses",
         store=False if model_api == "responses" else None,
+        include=["reasoning.encrypted_content"] if model_api == "responses" else None,
     )
     if model_api == "responses":
         # Validation stays outside negotiation; only async SDK calls select an API.
@@ -358,6 +362,102 @@ def test_build_model_rejects_invalid_api_before_client_or_auth(monkeypatch, mode
     model.assert_not_called()
 
 
+@pytest.mark.parametrize("include_headers", [False, True])
+def test_auto_stalled_error_body_releases_waiting_call_without_chat_fallback(monkeypatch, include_headers):
+    _select(monkeypatch, "auto")
+    monkeypatch.setattr(model_api_auto, "_NEGOTIATION_TIMEOUT_SECONDS", 0.1)
+    requests = []
+
+    async def exercise():
+        body_started = asyncio.Event()
+        connection_closed = asyncio.Event()
+        handlers = set()
+
+        async def handle(reader, writer):
+            task = asyncio.current_task()
+            handlers.add(task)
+            try:
+                header = await reader.readuntil(b"\r\n\r\n")
+                assert header.startswith(b"POST /compatible/v1/responses ")
+                length = next(
+                    int(line.split(b":", 1)[1]) for line in header.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                payload = json.loads(await reader.readexactly(length))
+                assert payload["model"] == "test-model"
+                assert payload["store"] is False
+                assert payload["stream"] is False
+                if not body_started.is_set():
+                    # Real HTTP transport closes a canceled body's connection;
+                    # MockTransport lacks httpcore's cancellation cleanup.
+                    writer.write(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 128\r\n\r\n"
+                    )
+                    await writer.drain()
+                    body_started.set()
+                    assert await reader.read() == b""
+                    connection_closed.set()
+                else:
+                    body = json.dumps(_reply("responses")).encode()
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                        + body
+                    )
+                    await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                handlers.discard(task)
+
+        async def record(request):
+            requests.append(request)
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        spec = _spec()
+        spec = spec.model_copy(update={"model": spec.model.model_copy(update={
+            "base_url": f"http://127.0.0.1:{port}/compatible/v1",
+        })})
+        calls = []
+        try:
+            with httpx.Client(trust_env=False) as sync_client:
+                async with httpx.AsyncClient(trust_env=False, event_hooks={"request": [record]}) as async_client:
+                    monkeypatch.setattr(agent_factory, "ChatOpenAI", partial(
+                        ChatOpenAI, http_client=sync_client, http_async_client=async_client,
+                        max_retries=0, include_response_headers=include_headers, timeout=None,
+                    ))
+                    async with agent_factory.build_runtime(spec) as runtime:
+                        calls.append(asyncio.create_task(runtime.run(RunRequest("first"))))
+                        await asyncio.wait_for(body_started.wait(), 2)
+                        assert not calls[0].done()
+                        calls.append(asyncio.create_task(runtime.run(RunRequest("second"))))
+                        results = await asyncio.wait_for(asyncio.gather(*calls, return_exceptions=True), 2)
+                        assert isinstance(results[0], AgentRunError)
+                        assert results[0].code == "ModelUpstreamError"
+                        assert results[0].status == 502
+                        assert not results[0].fatal
+                        assert results[1].text == "offline reply"
+                        assert runtime.state.selected == "responses"
+                        await asyncio.wait_for(connection_closed.wait(), 2)
+        finally:
+            for call in calls:
+                call.cancel()
+            await asyncio.gather(*calls, return_exceptions=True)
+            server.close()
+            await server.wait_closed()
+            for task in list(handlers):
+                task.cancel()
+            await asyncio.gather(*handlers, return_exceptions=True)
+
+    asyncio.run(exercise())
+    assert len(requests) == 2
+    assert all(request.extensions["timeout"] == {
+        "connect": 0.1, "read": 0.1, "write": 0.1, "pool": 0.1,
+    } for request in requests)
+
+
 @pytest.mark.parametrize("model_api", ["chat_completions", "responses"])
 @pytest.mark.parametrize("turn_model_api", ["chat_completions", "responses", "invalid-api"])
 def test_turn_and_later_process_env_cannot_override_startup_api(monkeypatch, model_api, turn_model_api):
@@ -492,6 +592,54 @@ def test_model_mcp_tool_roundtrip_and_retry(monkeypatch, model_api, output_versi
             invalid_result = next(msg for msg in messages if msg.get("tool_call_id") == "call-invalid")
             assert invalid_result["content"] == agent_factory._INVALID_TOOL_ARGUMENTS
     assert "MCP says hello" in str(tool_content)
+
+
+@pytest.mark.parametrize("selection", ["responses", "auto"])
+@pytest.mark.parametrize("output_version", ["v0", "responses/v1"])
+def test_responses_encrypted_reasoning_survives_tool_roundtrip(monkeypatch, selection, output_version):
+    _select(monkeypatch, selection)
+    payloads = []
+    calls = []
+    reasoning = {"id": "rs-call-1", "type": "reasoning", "summary": []}
+    encrypted_content = "encrypted-reasoning-state"
+
+    async def echo(text: str):
+        calls.append(text)
+        return "tool reply"
+
+    tool = StructuredTool.from_function(coroutine=echo, name=_TOOL_NAME, description="Echo text.")
+    monkeypatch.setattr(agent_factory.LangGraphRuntime, "_load_tools", mock.AsyncMock(return_value=[tool]))
+
+    def handle(request):
+        payload = _payload(request, "responses")
+        payloads.append(payload)
+        response = _reply("responses", arguments='{"text":"hello"}' if len(payloads) == 1 else None)
+        if len(payloads) == 1:
+            item = dict(reasoning)
+            # Like the provider, return replayable state only when requested.
+            if "reasoning.encrypted_content" in payload.get("include", []):
+                item["encrypted_content"] = encrypted_content
+            response["output"].insert(0, item)
+        return httpx.Response(200, json=response)
+
+    async def exercise():
+        async with _mock_upstream(monkeypatch, handle, output_version=output_version):
+            async with agent_factory.build_runtime(_spec()) as runtime:
+                return await runtime.run(RunRequest("hello"))
+
+    result = asyncio.run(exercise())
+
+    assert result.text == "offline reply"
+    assert calls == ["hello"]
+    assert len(payloads) == 2
+    assert [item for item in payloads[1]["input"] if item.get("type") == "reasoning"] == [
+        {**reasoning, "encrypted_content": encrypted_content},
+    ]
+    call, output = payloads[1]["input"][-2:]
+    assert call["type"] == "function_call"
+    assert output["type"] == "function_call_output"
+    assert call["call_id"] == output["call_id"] == "call-1"
+    assert all(payload["include"] == ["reasoning.encrypted_content"] for payload in payloads)
 
 
 @pytest.mark.parametrize("status", ["incomplete", "in_progress", "queued", "failed", None])

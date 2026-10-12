@@ -30,6 +30,8 @@ _ROUTE_ERRORS = {
     501: frozenset({"not implemented"}),
 }
 _MAX_ERROR_BODY_BYTES = 16 * 1024
+# Bound only API negotiation; accepted turns and their tools keep native limits.
+_NEGOTIATION_TIMEOUT_SECONDS = 60.0
 
 
 def is_unsupported_responses_response(status: int, body: Any) -> bool:
@@ -89,8 +91,25 @@ class AutoModelAPIState:
             resource = client.with_options(max_retries=0).responses
         return _AutoResponsesResource(resource, self)
 
+    async def _await_negotiation(self, value: Any) -> Any:
+        if self.selected is not None:
+            return await value
+        try:
+            async with asyncio.timeout(_NEGOTIATION_TIMEOUT_SECONDS):
+                return await value
+        except TimeoutError:
+            raise AgentRunError(
+                "model API negotiation timed out", code="ModelUpstreamError",
+            ) from None
+
     def _request_error(self, exc: Exception) -> None:
         for cause in _exception_chain(exc):
+            # SDKs may vendor HTTP clients (including httpx2); recognize the
+            # timeout base type without importing a model SDK or its HTTP stack.
+            if isinstance(cause, TimeoutError) or any(
+                cls.__name__ in {"TimeoutException", "APITimeoutError"} for cls in type(cause).__mro__
+            ):
+                return
             if getattr(cause, "code", None) in ("ModelAuthMissing", "ModelAuthRejected"):
                 return
             response = getattr(cause, "response", None)
@@ -146,7 +165,7 @@ class _AutoResponseContext:
 
     async def __aenter__(self) -> Any:
         try:
-            result = await self._context.__aenter__()
+            result = await self._state._await_negotiation(self._context.__aenter__())
         except Exception as exc:
             self._state._request_error(exc)
             raise
@@ -244,6 +263,10 @@ class _AutoResponsesResource:
         return value
 
     def create(self, *args: Any, **kwargs: Any) -> Any:
+        if self._state.selected is None:
+            # LangChain may disable HTTP timeouts. Keep the first attempt finite
+            # without changing this client's policy after an API is selected.
+            kwargs["timeout"] = _NEGOTIATION_TIMEOUT_SECONDS
         streaming = getattr(self._resource, "with_streaming_response", None)
         if streaming is not None:
             return self._create_with_headers(streaming, args, kwargs)
@@ -263,7 +286,7 @@ class _AutoResponsesResource:
         raw_mode = isinstance(headers, Mapping) and headers.get("X-Stainless-Raw-Response") in {"true", "stream"}
         context = streaming.create(*args, **kwargs)
         try:
-            response = await context.__aenter__()
+            response = await self._state._await_negotiation(context.__aenter__())
         except Exception as exc:
             self._state._request_error(exc)
             raise
@@ -286,7 +309,7 @@ class _AutoResponsesResource:
 
     async def _await_response(self, value: Any) -> Any:
         try:
-            result = await value
+            result = await self._state._await_negotiation(value)
         except Exception as exc:
             self._state._request_error(exc)
             raise
@@ -303,6 +326,8 @@ class _AutoStreamingResource:
         return getattr(self._resource, name)
 
     def create(self, *args: Any, **kwargs: Any) -> Any:
+        if self._state.selected is None:
+            kwargs["timeout"] = _NEGOTIATION_TIMEOUT_SECONDS
         return _AutoResponseContext(self._resource.create(*args, **kwargs), self._state)
 
 

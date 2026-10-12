@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from contextvars import ContextVar
 from datetime import timedelta
+from itertools import groupby
 from types import TracebackType
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -281,6 +282,52 @@ def _preserve_responses_phase(client) -> None:
         return items
 
     client._prepare_message_for_openai = prepare_with_phase
+
+    parse = getattr(client, "_parse_response_from_openai", None)
+    if not callable(parse):
+        return
+
+    def parse_with_phase(response, options):
+        chat_response = parse(response, options=options)
+        output = getattr(chat_response.raw_representation, "output", ())
+        # The non-streaming SDK parser flattens output into one assistant
+        # Message, but each converted text/refusal retains its native content.
+        # Use that identity, not text or phase equality, to recover boundaries.
+        message_indices = {
+            id(content): index
+            for index, item in enumerate(output)
+            if item.type == "message" and item.role == "assistant"
+            for content in item.content
+        }
+        if not message_indices:
+            return chat_response
+
+        messages = []
+        for message in chat_response.messages:
+            if message.role != "assistant" or not message.contents:
+                messages.append(message)
+                continue
+            for index, contents in groupby(
+                message.contents,
+                key=lambda content: message_indices.get(id(content.raw_representation)),
+            ):
+                preserved = copy.copy(message)
+                preserved.contents = list(contents)
+                preserved.additional_properties = dict(message.additional_properties)
+                if index is not None:
+                    native = output[index]
+                    preserved.message_id = native.id
+                    preserved.raw_representation = native
+                    phase = getattr(native, "phase", None)
+                    if phase in ("commentary", "final_answer"):
+                        preserved.additional_properties["phase"] = phase
+                messages.append(preserved)
+        # Keep the SDK's contents and response metadata; isolate native messages
+        # from tool items before the tool loop (and its serializer) consumes them.
+        chat_response.messages = messages
+        return chat_response
+
+    client._parse_response_from_openai = parse_with_phase
 
 
 def build_client(

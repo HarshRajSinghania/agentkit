@@ -782,3 +782,177 @@ def test_responses_facade_preserves_assistant_phase_on_upstream_wire(monkeypatch
     finally:
         for http in clients:
             asyncio.run(http.aclose())
+
+
+@pytest.mark.parametrize("selection", ["responses", "auto"])
+@pytest.mark.parametrize("foundry", [False, True], ids=["openai", "foundry"])
+@pytest.mark.parametrize("distinct_messages", [False, True], ids=["commentary-tool", "interleaved-messages-tools"])
+def test_generated_responses_messages_keep_phase_and_order_in_tool_loop(
+    monkeypatch, selection, foundry, distinct_messages,
+):
+    import json
+
+    import httpx
+    from agent_framework import FunctionTool
+    from agentkit_serve_common.config import ToolSpec
+
+    for name in (
+        "AGENTKIT_MODEL_WORKLOAD_IDENTITY_TOKEN", "AGENTKIT_WORKLOAD_IDENTITY_TOKEN",
+        "AGENTKIT_WORKLOAD_IDENTITY_TOKEN_COMMAND",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENTKIT_MODEL_API", selection)
+    spec = _spec(workload_identity=foundry).model_copy(update={
+        "tools": [ToolSpec(name="probe", type="mcp", command=["unused"])],
+    })
+    requests = []
+    calls = []
+    text = "Checking the logs."
+
+    def message(number, phase):
+        item = {
+            "type": "message", "id": f"msg_{number}", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+        if phase is not None:
+            item["phase"] = phase
+        return item
+
+    def function_call(number):
+        return {
+            "type": "function_call", "id": f"fc_{number}", "call_id": f"call_{number}",
+            "name": "probe_echo", "arguments": json.dumps({"value": str(number)}), "status": "completed",
+        }
+
+    output = [message(1, "commentary"), function_call(1)]
+    # Multiple text parts still belong to one native message.
+    output[0]["content"].append({"type": "output_text", "text": "One moment.", "annotations": []})
+    if distinct_messages:
+        # Equal text and even equal phases must not merge distinct native messages.
+        output.extend([
+            message(2, "commentary"), message(3, "commentary"), message(4, None), function_call(2),
+        ])
+
+    def echo(value: str) -> str:
+        calls.append(value)
+        return value
+
+    def handle(request):
+        assert request.url.path.endswith("/responses")
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(200, json={
+                "id": "resp_generated", "object": "response", "created_at": 1,
+                "model": spec.model.name, "status": "completed", "output": output,
+            })
+        assert len(requests) == 2
+        return _phase_reply("responses")
+
+    clients = _inject_phase_http(monkeypatch, handle, spec, foundry=foundry)
+    monkeypatch.setattr(
+        agent_factory, "build_tool",
+        lambda *args, **kwargs: FunctionTool(name="probe_echo", description="Echo value", func=echo),
+    )
+
+    async def run():
+        try:
+            async with agent_factory.build_runtime(spec) as runtime:
+                result = await runtime.run(RunRequest(prompt="Check the logs."))
+                assert result.text.endswith("Done.")
+                if selection == "auto":
+                    assert runtime.state.selected == "responses"
+        finally:
+            for client in clients:
+                await client.aclose()
+
+    asyncio.run(run())
+    assert len(requests) == 2
+    assert sorted(calls) == (["1", "2"] if distinct_messages else ["1"])
+    assert all(request["store"] is False for request in requests)
+    replay = [
+        item for item in requests[1]["input"]
+        if item["type"] == "function_call" or (item["type"] == "message" and item["role"] == "assistant")
+    ]
+
+    def signature(item):
+        if item["type"] == "function_call":
+            return ("function_call", item["call_id"], item["name"], item["arguments"])
+        return ("message", item.get("phase"), tuple(part["text"] for part in item["content"]))
+
+    assert [signature(item) for item in replay] == [signature(item) for item in output]
+    for native, item in zip(output, replay, strict=True):
+        if "phase" not in native:
+            assert "phase" not in item
+    results = [item for item in requests[1]["input"] if item["type"] == "function_call_output"]
+    assert [item["call_id"] for item in results] == (["call_1", "call_2"] if distinct_messages else ["call_1"])
+    assert all("phase" not in item for item in results)
+
+
+@pytest.mark.parametrize("phase", [None, "commentary", "final_answer"])
+def test_generated_responses_phase_parser_retains_sdk_contents_and_metadata(monkeypatch, phase):
+    from agent_framework.openai import OpenAIChatClient
+    from openai import AsyncOpenAI
+    from openai.types.responses import Response
+
+    raw = Response.model_validate({
+        "id": "resp_phase", "object": "response", "created_at": 1,
+        "model": "test-model", "status": "completed", "metadata": {"tag": "kept"},
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
+        "usage": {
+            "input_tokens": 4, "output_tokens": 3, "total_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0},
+        },
+        "output": [
+            {
+                "type": "message", "id": "msg_phase", "status": "completed", "role": "assistant", "phase": phase,
+                "content": [
+                    {"type": "output_text", "text": "Checking", "annotations": []},
+                    {"type": "refusal", "refusal": "the logs."},
+                ],
+            },
+            {
+                "type": "function_call", "id": "fc_phase", "call_id": "call_phase", "name": "probe_echo",
+                "arguments": '{"value":"test"}', "status": "completed",
+            },
+            {
+                "type": "message", "id": "msg_unphased", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Checking", "annotations": []}],
+            },
+        ],
+    })
+
+    async def run():
+        async with AsyncOpenAI(api_key="test-key") as sdk:
+            client = OpenAIChatClient(model="test-model", async_client=sdk)
+            parse = client._parse_response_from_openai
+            parsed = []
+
+            def capture(response, options):
+                result = parse(response, options=options)
+                parsed.append((result, [content for message in result.messages for content in message.contents]))
+                return result
+
+            monkeypatch.setattr(client, "_parse_response_from_openai", capture)
+            agent_factory._preserve_responses_phase(client)
+            result = client._parse_response_from_openai(raw, options={"store": False})
+            assert result is parsed[0][0]
+            contents = [content for message in result.messages for content in message.contents]
+            assert all(content is original for content, original in zip(contents, parsed[0][1], strict=True))
+            assert [len(message.contents) for message in result.messages] == [2, 1, 1]
+            first, tool, unphased = result.messages
+            assert first.message_id == "msg_phase"
+            assert first.raw_representation is raw.output[0]
+            assert first.additional_properties == ({"phase": phase} if phase else {})
+            assert tool.contents[0].type == "function_call"
+            assert tool.contents[0].call_id == "call_phase"
+            assert "phase" not in tool.additional_properties
+            assert unphased.message_id == "msg_unphased"
+            assert "phase" not in unphased.additional_properties
+            assert result.raw_representation is raw
+            assert result.response_id == raw.id
+            assert result.model == raw.model
+            assert result.additional_properties == {"tag": "kept"}
+            assert result.usage_details["input_token_count"] == 4
+            assert result.usage_details["output_token_count"] == 3
+
+    asyncio.run(run())

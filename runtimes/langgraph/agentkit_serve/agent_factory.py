@@ -229,6 +229,8 @@ def build_model(
         use_responses_api=model_api == "responses",
         # The runtime forwards explicit history, not provider-held conversations.
         store=False if model_api == "responses" else None,
+        # Stateless tool rounds need replayable reasoning, not provider-held IDs.
+        include=["reasoning.encrypted_content"] if model_api == "responses" else None,
     )
     if model_api == "responses":
         for client in (model.root_client, model.root_async_client):

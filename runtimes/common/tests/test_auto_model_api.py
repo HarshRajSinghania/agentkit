@@ -4,6 +4,8 @@ import asyncio
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
 
+import httpx
+import httpx2
 import pytest
 
 from agentkit_serve_common.acp import _discard_runtime_session
@@ -321,4 +323,132 @@ def test_accepted_headers_pin_api_before_untyped_body_read_failure():
         later = state.wrap_responses(Resource(HTTPError(404, {"detail": "Not Found"})))
         with pytest.raises(HTTPError):
             await later.create()
+    asyncio.run(exercise())
+
+
+def test_stalled_initial_request_releases_waiting_call_without_chat_fallback(monkeypatch):
+    from agentkit_serve_common import model_api_auto
+
+    monkeypatch.setattr(model_api_auto, "_NEGOTIATION_TIMEOUT_SECONDS", 0.02)
+
+    async def exercise():
+        started = asyncio.Event()
+        built, events, timeouts = [], [], []
+
+        class StalledResource:
+            calls = 0
+
+            async def create(self, **kwargs):
+                self.calls += 1
+                timeouts.append(kwargs.get("timeout"))
+                if self.calls == 1:
+                    started.set()
+                    await asyncio.Event().wait()
+                return {"text": "ok"}
+
+        def factory(api, state):
+            built.append(api)
+            runtime = Runtime(api, state, events, [])
+            runtime.resource = state.wrap_responses(StalledResource())
+            return runtime
+
+        async with AutoModelRuntime(factory) as runtime:
+            first = asyncio.create_task(runtime.run(RunRequest("first")))
+            await asyncio.wait_for(started.wait(), 1)
+            second = asyncio.create_task(runtime.run(RunRequest("second")))
+            results = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 1)
+            assert isinstance(results[0], AgentRunError)
+            assert results[0].code == "ModelUpstreamError"
+            assert not results[0].fatal
+            assert results[1].text == "responses"
+            assert runtime.state.selected == "responses"
+            assert built == ["responses"]
+            assert timeouts == [0.02, 0.02]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_http_timeout_is_only_overridden_before_api_selection(raw):
+    from agentkit_serve_common import model_api_auto
+
+    async def exercise():
+        calls = []
+
+        class RecordingResource:
+            async def create(self, **kwargs):
+                calls.append(kwargs)
+                return {"text": "ok"}
+
+        state = AutoModelAPIState()
+        guarded = state.wrap_responses(RecordingResource())
+        resource = guarded.with_raw_response if raw else guarded
+        await resource.create(timeout=None)
+        await resource.create(timeout=None)
+        assert calls[0]["timeout"] == model_api_auto._NEGOTIATION_TIMEOUT_SECONDS
+        assert calls[1]["timeout"] is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("streaming_context", [False, True])
+def test_negotiation_deadline_ends_at_accepted_headers(monkeypatch, streaming_context):
+    from agentkit_serve_common import model_api_auto
+
+    monkeypatch.setattr(model_api_auto, "_NEGOTIATION_TIMEOUT_SECONDS", 0.01)
+
+    class Raw:
+        async def parse(self):
+            await asyncio.sleep(0.03)
+            return {"text": "ok"}
+
+    class Context:
+        closed = False
+
+        async def __aenter__(self):
+            return Raw()
+
+        async def __aexit__(self, *args):
+            self.closed = True
+
+    class StreamingResource:
+        def __init__(self):
+            self.context = Context()
+
+        @property
+        def with_streaming_response(self):
+            return self
+
+        def create(self, **kwargs):
+            return self.context
+
+    async def exercise():
+        state = AutoModelAPIState()
+        native = StreamingResource()
+        resource = state.wrap_responses(native)
+        if streaming_context:
+            async with resource.with_streaming_response.create() as response:
+                assert state.selected == "responses"
+                assert await response.parse() == {"text": "ok"}
+        else:
+            assert await resource.create() == {"text": "ok"}
+        assert state.selected == "responses"
+        assert native.context.closed
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("error_type", [TimeoutError, httpx.ReadTimeout, httpx2.ReadTimeout])
+def test_timeout_cannot_use_an_older_endpoint_error_to_fallback(error_type):
+    error = error_type("private-timeout")
+    error.__cause__ = HTTPError(404, {"detail": "Not Found"})
+
+    async def exercise():
+        state = AutoModelAPIState()
+        resource = state.wrap_responses(Resource(error))
+        with pytest.raises((AgentRunError, error_type)) as captured:
+            await resource.create()
+        assert not isinstance(captured.value, ModelAPIFallback)
+        assert state.selected is None
+
     asyncio.run(exercise())
