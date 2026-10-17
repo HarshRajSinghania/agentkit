@@ -54,7 +54,51 @@ resolved; the original provider URL and workload-identity auth are never used.
 Keep provider keys out of the image, process, Config, logs and argv. The local
 bridge token is generated per execution and is not a provider credential.
 
-See the [keyless launch example](../README.md#agentsessions-keyless-text-profile).
+## Keyless launch example
+
+For an already-built tool/context-free agent, set `AGENT_IMAGE` to an immutable
+agent image reference, `IMPLEMENTATION_DIGEST` to the immutable adapter image
+digest (`sha256:<64 lowercase hex>`) including installed dependencies, and
+`PRIVATE_NETWORK` to a private Docker bridge network pre-created with
+`--internal` by the deployment owner. Run this example and the gRPC client on the
+**Linux Docker daemon host**; it uses the container's private IP, not a published
+host port. This is not a Docker Desktop or remote-daemon client recipe. Reserve
+`agentkit-agentsessions` as the container name for this example only.
+
+Extract a local `agent.yaml` containing **the exact bytes baked at
+`/agent/agent.yaml`**, then compute its digest outside the runtime, not from the
+source Agentkitfile. Retain these artifacts for replay.
+
+```sh
+CONFIG_DIGEST="sha256:$(sha256sum agent.yaml | cut -d ' ' -f1)"
+docker run -d --rm --name agentkit-agentsessions \
+  --network "${PRIVATE_NETWORK:?set a pre-created private internal bridge network}" \
+  -e AGENTKIT_PROTOCOL=agentsessions \
+  -e AGENTKIT_BIND=0.0.0.0 \
+  -e AGENTKIT_PORT=8080 \
+  -e AGENTKIT_AUTH_TOKEN="${AGENTKIT_AUTH_TOKEN:?set a harness bearer token}" \
+  -e AGENTKIT_AGENTSESSIONS_AGENT_CONFIGURATION_DIGEST="$CONFIG_DIGEST" \
+  -e AGENTKIT_AGENTSESSIONS_IMPLEMENTATION_DIGEST="${IMPLEMENTATION_DIGEST:?set an immutable adapter digest}" \
+  "${AGENT_IMAGE:?set an immutable agent image reference}"
+
+HARNESS_IP="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' agentkit-agentsessions)"
+HARNESS_ADDRESS="${HARNESS_IP}:8080"
+```
+
+Do **not** pass a provider key. The host services model effects; original provider
+URLs/auth and required-env declarations are not used. From the daemon host, dial
+`HARNESS_ADDRESS` with an h2c gRPC client for both `Harness.Describe` and
+`Harness.Connect`, supplying exactly one `authorization: Bearer <token>` metadata
+entry to each RPC, using the configured `AGENTKIT_AUTH_TOKEN`. h2c has no built-in
+TLS: keep it private or use a trusted TLS/auth proxy, and enforce egress isolation
+in deployment. Digests bind identity, not authentication or attestation.
+
+When finished, stop the detached example container (`--rm` removes it); the
+pre-created network remains owned by the deployment owner:
+
+```sh
+docker stop agentkit-agentsessions
+```
 
 ## Transport and authentication
 
