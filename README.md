@@ -92,6 +92,7 @@ Protocol endpoints:
 | `foundry` | `/readiness`, `/invocations`, `/responses` | `/responses` is `foundry-responses-minimal`: synchronous/non-streaming only. |
 | `orka` | `/v1/health`, `/v1/capabilities`, `/v1/turns`, `/v1/turns/{turnID}/events`, `/v1/turns/{turnID}/continue`, `/v1/turns/{turnID}/cancel` | Observed-mode `orka.harness.v1` over HTTP+SSE by default. AgentKit reports frames; Orka enforces policy. Brokered read/write/coordination are feature-gated for conformance. |
 | `acp` | stdin/stdout | ACP protocol v1 child mode for Orka `orka.harness.v2`. It opens no network listener and accepts only the supervisor's loopback provider proxy and prompt-scoped HTTP MCP server. |
+| `agentsessions` | Native gRPC `agentsessions.v1.Harness.Describe` / `Harness.Connect` (h2c) | All three runtimes: keyless, host-mediated text-only execution; required configuration/implementation digests, no tools/context providers, no HTTP health endpoint. [Subset and replay limits](docs/agentsessions.md). |
 
 After deploying the image with `AGENTKIT_PROTOCOL=orka` and an
 `AGENTKIT_AUTH_TOKEN` sourced from the Orka client-auth Secret, render an Orka
@@ -292,15 +293,19 @@ runtime: langgraph
 ```
 
 All runtimes read the same built agent config and serve the same non-streaming
-OpenAI-compatible API. Runtime capabilities are explicit and validated before
-build; see [`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
+OpenAI-compatible API in the default mode. All three also support the restricted
+[agentsessions text profile](docs/agentsessions.md), which rejects tools and
+context providers regardless of the normal runtime's capabilities. Runtime
+capabilities are explicit and validated before build; see
+[`docs/runtime-capabilities.md`](docs/runtime-capabilities.md) and
 [`docs/runtime-adapters.md`](docs/runtime-adapters.md).
 
 ## Configure the server
 
-By default, generated images bind to `127.0.0.1` inside the container. If you bind
-to a non-loopback address such as `0.0.0.0`, set `AGENTKIT_AUTH_TOKEN`; `/v1/*`
-requests must then include `Authorization: Bearer <token>`.
+In the default OpenAI HTTP mode, generated images bind to `127.0.0.1` inside the
+container. If you bind to a non-loopback address such as `0.0.0.0`, set
+`AGENTKIT_AUTH_TOKEN`; `/v1/*` requests must then include
+`Authorization: Bearer <token>`.
 
 ```sh
 docker run --rm \
@@ -405,6 +410,8 @@ workflow.
 - [`docs/development.md`](docs/development.md) — local development and CI.
 - [`docs/release.md`](docs/release.md) — publishing images and package setup.
 - [`docs/orka.md`](docs/orka.md) — Orka harness mode and AgentRuntime rendering.
+- [`docs/agentsessions.md`](docs/agentsessions.md) — native gRPC text profile,
+  immutable startup binding, auth, lifecycle and controller replay proof.
 - [`docs/architecture.md`](docs/architecture.md) — codebase architecture map for
   contributors.
 - [`deploy/foundry/README.md`](deploy/foundry/README.md) — Foundry deployment and
